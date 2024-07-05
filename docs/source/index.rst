@@ -30,6 +30,8 @@ vLLM is fast with:
 * State-of-the-art serving throughput
 * Efficient management of attention key and value memory with **PagedAttention**
 * Continuous batching of incoming requests
+* Fast model execution with CUDA/HIP graph
+* Quantization: `GPTQ <https://arxiv.org/abs/2210.17323>`_, `AWQ <https://arxiv.org/abs/2306.00978>`_, `SqueezeLLM <https://arxiv.org/abs/2306.07629>`_, FP8 KV Cache
 * Optimized CUDA kernels
 
 vLLM is flexible and easy to use with:
@@ -39,13 +41,16 @@ vLLM is flexible and easy to use with:
 * Tensor parallelism support for distributed inference
 * Streaming outputs
 * OpenAI-compatible API server
-* Support NVIDIA CUDA and AMD ROCm.
+* Support NVIDIA GPUs and AMD GPUs
+* (Experimental) Prefix caching support
+* (Experimental) Multi-lora support
 
 For more information, check out the following:
 
 * `vLLM announcing blog post <https://vllm.ai>`_ (intro to PagedAttention)
 * `vLLM paper <https://arxiv.org/abs/2309.06180>`_ (SOSP 2023)
 * `How continuous batching enables 23x throughput in LLM inference while reducing p50 latency <https://www.anyscale.com/blog/continuous-batching-llm-inference>`_ by Cade Daniel et al.
+* :ref:`vLLM Meetups <meetups>`.
 
 
 
@@ -58,18 +63,28 @@ Documentation
 
    getting_started/installation
    getting_started/amd-installation
+   getting_started/openvino-installation
+   getting_started/cpu-installation
+   getting_started/neuron-installation
+   getting_started/tpu-installation
+   getting_started/xpu-installation
    getting_started/quickstart
+   getting_started/debugging
+   getting_started/examples/examples_index
 
 .. toctree::
    :maxdepth: 1
    :caption: Serving
 
-   serving/distributed_serving
-   serving/run_on_sky
-   serving/deploying_with_triton
+   serving/openai_compatible_server
    serving/deploying_with_docker
-   serving/serving_with_langchain
+   serving/distributed_serving
    serving/metrics
+   serving/env_vars
+   serving/usage_stats
+   serving/integrations
+   serving/tensorizer
+   serving/faq
 
 .. toctree::
    :maxdepth: 1
@@ -78,9 +93,48 @@ Documentation
    models/supported_models
    models/adding_model
    models/engine_args
+   models/lora
+   models/vlm
+   models/spec_decode
+   models/performance
 
 .. toctree::
    :maxdepth: 1
    :caption: Quantization
 
+   quantization/supported_hardware
    quantization/auto_awq
+   quantization/fp8
+   quantization/fp8_e5m2_kvcache
+   quantization/fp8_e4m3_kvcache
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Automatic Prefix Caching
+
+   automatic_prefix_caching/apc
+   automatic_prefix_caching/details
+
+.. toctree::
+   :caption: Developer Documentation
+
+   dev/sampling_params
+   dev/offline_inference/offline_index
+   dev/engine/engine_index
+   dev/kernel/paged_attention
+   dev/input_processing/model_inputs_index
+   dev/multimodal/multimodal_index
+   dev/dockerfile/dockerfile
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Community
+
+   community/meetups
+   community/sponsors
+
+Indices and tables
+==================
+
+* :ref:`genindex`
+* :ref:`modindex`
