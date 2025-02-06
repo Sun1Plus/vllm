@@ -1,4 +1,5 @@
-# coding=utf-8
+# SPDX-License-Identifier: Apache-2.0
+
 # Copyright 2024 The vLLM team.
 # Copyright 2024 Microsoft and the HuggingFace Inc. team. All rights reserved.
 #
@@ -13,49 +14,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import re
-from functools import lru_cache
-from typing import Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+from collections.abc import Iterable, Mapping, Sequence
+from functools import cached_property
+from typing import Any, List, Literal, Optional, Set, Tuple, TypedDict, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image
-from transformers import CLIPVisionConfig, PretrainedConfig
+from transformers import (BatchFeature, CLIPVisionConfig, PretrainedConfig,
+                          ProcessorMixin)
 
 from vllm.attention import AttentionMetadata
-from vllm.config import CacheConfig, ModelConfig, MultiModalConfig
-from vllm.inputs import INPUT_REGISTRY, InputContext, LLMInputs
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
-from vllm.model_executor.layers.sampler import Sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.clip import CLIPVisionModel
-from vllm.model_executor.models.llama import LlamaModel
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.multimodal import MULTIMODAL_REGISTRY, BatchedTensors
-from vllm.multimodal.image import cached_get_tokenizer
-from vllm.sequence import IntermediateTensors, SamplerOutput
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (MultiModalFieldConfig, MultiModalKwargs,
+                                    NestedTensors)
+from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
+                                   ImageSize, MultiModalDataItems)
+# yapf conflicts with isort for this block
+# yapf: disable
+from vllm.multimodal.processing import (BaseMultiModalProcessor,
+                                        BaseProcessingInfo,
+                                        BoundPromptReplacement,
+                                        PlaceholderFeaturesInfo,
+                                        PromptReplacement,
+                                        PromptReplacementDetails)
+# yapf: enable
+from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
+from vllm.sequence import IntermediateTensors
+from vllm.utils import is_list_of
 
-from .clip import (dummy_image_for_clip, dummy_seq_data_for_clip,
-                   input_processor_for_clip)
-from .interfaces import SupportsVision
+from .clip import CLIPVisionModel
+from .interfaces import SupportsMultiModal, SupportsPP
+from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
+                    init_vllm_registered_model, maybe_prefix,
+                    merge_multimodal_embeddings)
 
 logger = init_logger(__name__)
 
-_KEYS_TO_MODIFY_MAPPING = {
-    "model.vision_embed_tokens": "vision_embed_tokens",
-}
-
 # Cannot find the following 2 numbers from hf config.
 _IMAGE_TOKEN_ID = 32044
-
-# Result in the max possible feature size (h:w = 16:1)
-MAX_IMAGE_FEATURE_SIZE_HEIGHT = 8000
-MAX_IMAGE_FEATURE_SIZE_WIDTH = 50
 
 CLIP_VIT_LARGE_PATCH14_336_CONFIG = CLIPVisionConfig(dropout=0.0,
                                                      hidden_act="quick_gelu",
@@ -69,24 +72,75 @@ CLIP_VIT_LARGE_PATCH14_336_CONFIG = CLIPVisionConfig(dropout=0.0,
                                                      projection_dim=768)
 
 
+def _init_img_processor(hf_config: PretrainedConfig,
+                        quant_config: Optional[QuantizationConfig],
+                        prefix: str = "") -> CLIPVisionModel:
+    clip_config = CLIP_VIT_LARGE_PATCH14_336_CONFIG
+    layer_idx = hf_config.img_processor.get('layer_idx', -2)
+
+    # Initialize the CLIP only up to the required feature layer
+    if layer_idx < 0:
+        num_hidden_layers = clip_config.num_hidden_layers + \
+            layer_idx + 1
+    else:
+        num_hidden_layers = layer_idx + 1
+
+    img_processor = CLIPVisionModel(
+        clip_config,
+        quant_config,
+        num_hidden_layers_override=num_hidden_layers,
+        prefix=prefix,
+    )
+
+    return img_processor
+
+
+class Phi3VImagePixelInputs(TypedDict):
+    type: Literal["pixel_values"]
+    data: Union[torch.Tensor, List[torch.Tensor]]
+    """
+    Shape:
+    `(batch_size * num_images, 1 + num_patches, num_channels, height, width)`
+
+    Note that `num_patches` may be different per batch and image,
+    in which case the data is passed as a list instead of a batched tensor.
+    """
+
+    image_sizes: torch.Tensor
+    """
+    Shape: `(batch_size * num_images, 2)`
+
+    This should be in `(height, width)` format.
+    """
+
+
+class Phi3VImageEmbeddingInputs(TypedDict):
+    type: Literal["image_embeds"]
+    data: Union[torch.Tensor, List[torch.Tensor]]
+    """Shape: `(batch_size * num_images, image_feature_size, hidden_size)`
+
+    `hidden_size` must match the hidden size of language model backbone.
+    """
+
+
+Phi3VImageInputs = Union[Phi3VImagePixelInputs, Phi3VImageEmbeddingInputs]
+
+
 class Phi3ImageEmbeddingBase(nn.Module):
 
-    def __init__(self, wte=None) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.wte = wte
         self.layer_idx: int
         self.type_feature: str
         self.img_processor: CLIPVisionModel
 
     def get_img_features(self,
                          img_embeds: torch.FloatTensor) -> torch.FloatTensor:
-        LAYER_IDX = self.layer_idx
         TYPE_FEATURE = self.type_feature
 
         # NOTE: we skip the step to select the vision feature layer since
         # this is already done inside the img_processor
-        img_feature = self.img_processor(img_embeds,
-                                         vision_feature_layer=LAYER_IDX)
+        img_feature = self.img_processor(img_embeds)
 
         if TYPE_FEATURE == "patch":
             patch_feature = img_feature[:, 1:]
@@ -102,16 +156,19 @@ class Phi3ImageEmbeddingBase(nn.Module):
 class Phi3HDImageEmbedding(Phi3ImageEmbeddingBase):
     """Phi3 Image embedding with HD transform."""
 
-    def __init__(self, config: PretrainedConfig, wte=None) -> None:
-        super().__init__(wte)
+    def __init__(self,
+                 config: PretrainedConfig,
+                 quant_config: Optional[QuantizationConfig],
+                 prefix: str = "") -> None:
+        super().__init__()
 
-        self.image_token_id = _IMAGE_TOKEN_ID
         # n_embed or hidden_size
         hidden_size = config.n_embd if hasattr(
             config, 'n_embd') else config.hidden_size
 
-        clip_config = CLIP_VIT_LARGE_PATCH14_336_CONFIG
-        self.img_processor = CLIPVisionModel(clip_config)
+        self.img_processor = _init_img_processor(
+            config, quant_config, prefix=f"{prefix}.img_processor")
+
         image_dim_out = config.img_processor['image_dim_out']
         self.num_img_tokens = config.img_processor['num_img_tokens']
 
@@ -141,333 +198,373 @@ class Phi3HDImageEmbedding(Phi3ImageEmbeddingBase):
                  nn.Linear(dim_projection, dim_projection)])
         self.img_projection = nn.Sequential(*layers)
 
-        self.vocab_size = config.vocab_size
-
-        self.layer_idx = config.img_processor.get('layer_idx', -2)
         self.type_feature = config.img_processor.get('type_feature', 'patch')
 
-    def forward(self, input_ids: torch.LongTensor,
-                pixel_values: torch.FloatTensor,
+    def forward(self, pixel_values: torch.FloatTensor,
                 image_sizes: torch.Tensor) -> torch.FloatTensor:
-        """process and merge text embeddings with image embeddings."""
-
-        # (batch_size, max_num_crops, 3, height, width)
-        img_embeds = pixel_values
-
-        # (batch_size, 2)
-        img_sizes = image_sizes
-
-        input_shape = input_ids.size()
-        input_ids = input_ids.view(-1, input_shape[-1])
-
-        positions = torch.nonzero(input_ids == self.image_token_id)
-
-        select = False
-
-        target_dtype = self.img_projection[0].bias.dtype
-
-        if len(positions.tolist()) > 0:
-            # if self.use_hd_transform and img_sizes:
-            # img_embeds: (num_images, max_num_crops, 3, H, W)
-            # img_sizes: (num_images, 2).view(1, -1)
-
-            bs = img_embeds.shape[0]
-            # Nx(HW)xC
-            img_features = self.get_img_features(img_embeds.flatten(0, 1))
-            base_feat_height = base_feat_width = int(
-                img_features.shape[1]**0.5)
-
-            # bs x max_num_crops x (24x24) x C
-            img_features = img_features.view(
-                bs, -1, base_feat_height * base_feat_width, self.image_dim_out)
-            C = self.image_dim_out
-            H = base_feat_height
-
-            output_imgs = []
-            output_len = []
-
-            for _bs in range(bs):
-                h, w = img_sizes[_bs]
-                h = h // 336
-                w = w // 336
-                B_ = h * w
-
-                # 1 x (24x24) x 1024
-                global_img_feature = img_features[_bs, :1]
-
-                # 1 x 12 x 12 x 4096
-                glb_img = global_img_feature \
-                    .reshape(1, H // 2, 2, H // 2, 2,C) \
-                    .permute(0, 1, 3, 2, 4, 5) \
-                    .reshape(1, H // 2, H // 2, 4 * C)
-                temp_glb_GN = self.sub_GN.repeat(1, H // 2, 1, 1)
-
-                # 1 x 156 x 4096
-                glb_img = torch.cat([glb_img, temp_glb_GN],
-                                    dim=2).reshape(1, -1, 4 * C)
-
-                # (max_num_crops-1) x (12x12) x C
-                sub_img = img_features[_bs, 1:]
-                # 16x574x1024
-                # get rid of padding sub_img
-                sub_img = sub_img[:B_]
-
-                sub_img = sub_img.reshape(B_, H // 2, 2, H // 2, 2, C) \
-                    .permute(0, 1, 3, 2, 4, 5).reshape(B_, -1, 4 * C)
-                sub_img = sub_img.reshape(1, h, w, 12, 12, -1) \
-                    .permute(0, 1, 3, 2, 4, 5) \
-                    .reshape(1, h * 12, w * 12, 4 * C)
-                temp_sub_GN = self.sub_GN.repeat(1, h * 12, 1, 1)
-                sub_img = torch.cat([sub_img, temp_sub_GN],
-                                    dim=2).reshape(1, -1, 4 * C)
-                # (1, num_img_tokens, 1024*4)
-
-                # glb + sub
-                if self.hd_transform_order == 'glb_sub':
-                    output_imgs.append(
-                        torch.cat([glb_img, self.glb_GN, sub_img], dim=1))
-                elif self.hd_transform_order == 'sub_glb':
-                    output_imgs.append(
-                        torch.cat([sub_img, self.glb_GN, glb_img], dim=1))
-
-                temp_len = int((h * w + 1) * 144 + 1 + (h + 1) * 12)
-                output_len.append(temp_len)
-
-            num_img_tokens = output_len
-            img_set_tensor = []
-            for _output_img in output_imgs:
-                img_feature_proj = self.img_projection(
-                    _output_img.to(target_dtype))
-                img_set_tensor.append(img_feature_proj)
-            select = True
-
-        input_ids.clamp_min_(0).clamp_max_(self.vocab_size)
-
-        hidden_states = self.wte(input_ids)
-
-        if select:
-            idx = 0
-            for i, cnt in enumerate(num_img_tokens):
-                hidden_states[positions[idx, 0],
-                              positions[idx, 1]:positions[idx, 1] +
-                              cnt] = (img_set_tensor[i].to(
-                                  hidden_states.dtype))
-                idx += cnt
-
-        return hidden_states.squeeze(0)
-
-
-class Phi3VImagePixelInputs(TypedDict):
-    type: Literal["pixel_values"]
-    data: BatchedTensors
-    """
-    Shape: `(batch_size, 1 + num_patches, num_channels, height, width)`
-
-    Note that `num_patches` may be different for each batch.
-    """
-
-    image_sizes: torch.Tensor
-    """
-    Shape: `(batch_size, 2)`
-
-    This should be in `(height, width)` format.
-    """
-
-
-# Based on https://huggingface.co/microsoft/Phi-3-vision-128k-instruct/blob/main/image_processing_phi3_v.py#L57
-def _calc_padded_size(*, width: int, height: int, padding_unit: int = 336):
-    target_height = int(np.ceil(height / padding_unit) * padding_unit)
-    top_padding = int((target_height - height) / 2)
-    bottom_padding = target_height - height - top_padding
-    padded_width = width
-    padded_height = height + top_padding + bottom_padding
-    return padded_width, padded_height
-
-
-# Based on https://huggingface.co/microsoft/Phi-3-vision-128k-instruct/blob/main/image_processing_phi3_v.py#L90
-def _calc_hd_transform_size(*, width: int, height: int, hd_num: int = 16):
-    transposed = False
-    if width < height:
-        width, height = height, width
-        transposed = True
-
-    ratio = width / height
-    scale = 1
-    while scale * np.ceil(scale / ratio) <= hd_num:
-        scale += 1
-    scale -= 1
-
-    new_width = int(scale * 336)
-    new_height = int(new_width / ratio)
-
-    padded_width, padded_height = _calc_padded_size(width=new_width,
-                                                    height=new_height)
-
-    if transposed:
-        padded_width, padded_height = padded_height, padded_width
-
-    return padded_width, padded_height
-
-
-# Based on https://huggingface.co/microsoft/Phi-3-vision-128k-instruct/blob/main/image_processing_phi3_v.py#L181
-def get_phi3v_image_feature_size(
-    hf_config: PretrainedConfig,
-    *,
-    input_height: int,
-    input_width: int,
-) -> int:
-    num_crops = getattr(hf_config, "num_crops", 16)
-    new_width, new_height = _calc_hd_transform_size(width=input_width,
-                                                    height=input_height,
-                                                    hd_num=num_crops)
-
-    return (new_height // 336 * new_width // 336 + 1) * 144 + 1 \
-        + (new_height // 336 + 1) * 12
-
-
-def get_max_phi3v_image_tokens(ctx: InputContext):
-
-    return get_phi3v_image_feature_size(
-        ctx.get_hf_config(PretrainedConfig),
-        input_height=MAX_IMAGE_FEATURE_SIZE_HEIGHT,
-        input_width=MAX_IMAGE_FEATURE_SIZE_WIDTH,
-    )
-
-
-def dummy_data_for_phi3v(ctx: InputContext, seq_len: int):
-
-    image_feature_size = get_max_phi3v_image_tokens(ctx)
-
-    seq_data = dummy_seq_data_for_clip(
-        CLIP_VIT_LARGE_PATCH14_336_CONFIG,
-        seq_len,
-        image_token_id=_IMAGE_TOKEN_ID,
-        image_feature_size_override=image_feature_size,
-    )
-    mm_data = dummy_image_for_clip(
-        CLIP_VIT_LARGE_PATCH14_336_CONFIG,
-        image_width_override=MAX_IMAGE_FEATURE_SIZE_WIDTH,
-        image_height_override=MAX_IMAGE_FEATURE_SIZE_HEIGHT,
-    )
-
-    return seq_data, mm_data
-
-
-# Reserve this function to also handle placeholders for additional images
-# [ref: PR #5820]
-@lru_cache
-def _get_image_placeholder_token_ids(model_config: ModelConfig,
-                                     idx: int) -> List[int]:
-    assert idx > 0
-
-    tokenizer = cached_get_tokenizer(model_config.tokenizer)
-
-    # We need to get the token for "<", not "▁<"
-    # https://huggingface.co/microsoft/Phi-3-vision-128k-instruct/raw/main/tokenizer.json
-    a_token_id, = tokenizer.encode("a", add_special_tokens=False)
-    a_token_id_, *image_placeholder_token_ids = tokenizer.encode(
-        f"a<|image_{idx}|>", add_special_tokens=False)
-    assert a_token_id == a_token_id_
-
-    return image_placeholder_token_ids
-
-
-def input_processor_for_phi3v(ctx: InputContext, llm_inputs: LLMInputs):
-    multi_modal_data = llm_inputs.get("multi_modal_data")
-    if multi_modal_data is None or "image" not in multi_modal_data:
-        return llm_inputs
-
-    model_config = ctx.model_config
-    hf_config = ctx.get_hf_config(PretrainedConfig)
-
-    image_data = multi_modal_data["image"]
-    if isinstance(image_data, Image.Image):
-        w, h = image_data.size
-        w, h = _calc_hd_transform_size(width=w, height=h)
-
-        image_feature_size = get_phi3v_image_feature_size(hf_config,
-                                                          input_width=w,
-                                                          input_height=h)
-    elif isinstance(image_data, torch.Tensor):
-        raise NotImplementedError("Embeddings input is not supported yet")
-    else:
-        raise TypeError(f"Invalid image type: {type(image_data)}")
-
-    prompt = llm_inputs.get("prompt")
-    if prompt is None:
-        new_prompt = None
-    else:
-        if prompt.count("<|image|>") > 0:
-            logger.warning("Please follow the prompt format that is "
-                           "documented on HuggingFace which does not involve "
-                           "repeating <|image|> tokens.")
-        elif len(re.findall(r"(<\|image_\d+\|>)+", prompt)) > 1:
-            logger.warning("Multiple image input is not supported yet, "
-                           "so any extra image tokens will be treated "
-                           "as plain text.")
-
-        new_prompt = prompt
-
-    prompt_token_ids = llm_inputs["prompt_token_ids"]
-    image_1_token_ids = _get_image_placeholder_token_ids(model_config, idx=1)
-
-    new_token_ids: List[int] = []
-    for i in range(len(prompt_token_ids) - len(image_1_token_ids) + 1):
-        if prompt_token_ids[i:i + len(image_1_token_ids)] == image_1_token_ids:
-            new_token_ids.append(_IMAGE_TOKEN_ID)
-
-            # No need to further scan the list since we only replace once
-            new_token_ids.extend(prompt_token_ids[i + len(image_1_token_ids):])
-            break
-        else:
-            new_token_ids.append(prompt_token_ids[i])
-
-    # NOTE: Create a defensive copy of the original inputs
-    llm_inputs = LLMInputs(prompt_token_ids=new_token_ids,
-                           prompt=new_prompt,
-                           multi_modal_data=multi_modal_data)
-
-    return input_processor_for_clip(
-        model_config,
-        CLIP_VIT_LARGE_PATCH14_336_CONFIG,
-        llm_inputs,
-        image_token_id=_IMAGE_TOKEN_ID,
-        image_feature_size_override=image_feature_size,
-    )
-
-
-@MULTIMODAL_REGISTRY.register_image_input_mapper()
-@MULTIMODAL_REGISTRY.register_max_image_tokens(get_max_phi3v_image_tokens)
-@INPUT_REGISTRY.register_dummy_data(dummy_data_for_phi3v)
-@INPUT_REGISTRY.register_input_processor(input_processor_for_phi3v)
-class Phi3VForCausalLM(nn.Module, SupportsVision):
-
-    def __init__(self,
-                 config: PretrainedConfig,
-                 multimodal_config: MultiModalConfig,
-                 cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None) -> None:
+        """
+        process image and return vision embeddings.
+
+        pixel_values: (num_images, num_crops, c, h, w)
+        output: (num_images, num_img_tokens, hidden_size)
+        """
+        num_images, num_crops, c, h, w = pixel_values.shape
+        pixel_values = pixel_values.flatten(0, 1)
+        img_features = self.get_img_features(pixel_values)
+        img_features = img_features.reshape(num_images, num_crops, -1,
+                                            self.image_dim_out)
+        image_features_proj = self.hd_feature_transform(
+            img_features, image_sizes)
+        return image_features_proj
+
+    def hd_feature_transform(self, image_features, image_sizes):
+        """
+        image_features: (num_images, num_crops+1, 24*24, 1024)
+        """
+        assert (
+            self.hd_transform_order == 'sub_glb'
+        ), f'hd_transform_order `{self.hd_transform_order}` not implemented'
+        if isinstance(self.img_projection, nn.Sequential):
+            target_device = self.img_projection[0].bias.device
+            target_dtype = self.img_projection[0].bias.dtype
+        else:  # It's a single nn.Linear layer
+            target_device = self.img_projection.bias.device
+            target_dtype = self.img_projection.bias.dtype
+
+        global_image_features = image_features[:,
+                                               0]  # (num_images, 24*24, 1024)
+        # global feature can be viewed as a special HD case with num_crops 1x1
+        global_image_features_hd = self.reshape_hd_patches_2x2merge(
+            global_image_features, 1, 1)
+        global_image_features_hd_newline = self.add_image_newline(
+            global_image_features_hd)
+
+        batch_image_features_proj = []
+        # need a for loop to process each image because of different image sizes
+        # (patch arrangement is different for each image)
+        for i, img_size in enumerate(image_sizes):
+            h, w = img_size
+            h_crop = h // 336
+            w_crop = w // 336
+            num_crops = h_crop * w_crop
+
+            # NOTE: real num_crops is padded
+            # (num_crops, 24*24, 1024)
+            sub_image_features = image_features[i, 1:1 + num_crops]
+            sub_image_features_hd = self.reshape_hd_patches_2x2merge(
+                sub_image_features, h_crop, w_crop)
+            sub_image_features_hd_newline = self.add_image_newline(
+                sub_image_features_hd)
+
+            # [sub features, separator, global features]
+            image_embeddings = torch.cat([
+                sub_image_features_hd_newline.squeeze(
+                    0),  # (h_crop*12*(w_crop*12+1), 4096)
+                self.glb_GN.squeeze(0),
+                global_image_features_hd_newline[i],
+            ])
+            img_proj = self.img_projection(
+                image_embeddings.to(target_device, target_dtype))
+            batch_image_features_proj.append(img_proj)
+
+        return batch_image_features_proj
+
+    def reshape_hd_patches_2x2merge(self, image_features, h_crop, w_crop):
+        """
+        image_features: (num_images*num_crops, 24*24, 1024)
+        output: (num_images, h_crop*12, w_crop*12, 4096)
+        where h_crop*w_crop == num_crops
+        """
+        N, L, C = image_features.shape
+        assert L == 576 and C == 1024 and N % (h_crop * w_crop) == 0
+        num_images = N // (h_crop * w_crop)
+        H = int(L**0.5)
+        image_features_hd = (
+            image_features.reshape(N, H, H, C)  # N, 24, 24, 1024
+            .reshape(N, H // 2, 2, H // 2, 2, C)  # N, 12, 2, 12, 2, 1024
+            .permute(0, 1, 3, 2, 4, 5)  # N, 12, 12, 2, 2, 1024
+            .reshape(N, -1, 4 * C)  # N, 144, 4096
+            .reshape(num_images, h_crop, w_crop, H // 2, H // 2,
+                     -1)  # n_img, h_crop, w_crop, 12, 12, 4096
+            .permute(0, 1, 3, 2, 4, 5)  # n_img, h_crop, 12, w_crop, 12, 4096
+            .reshape(num_images, h_crop * H // 2, w_crop * H // 2,
+                     4 * C)  # n_img, h_crop*12, w_crop*12, 4096
+        )
+        return image_features_hd
+
+    def add_image_newline(self, image_features_hd):
+        """
+        image_features_hd: (num_images, h_crop*12, w_crop*12, 4096)
+        output: (num_images, (h_crop*12) * (w_crop*12+1), 4096)
+        """
+        num_images, h, w, hid_dim = image_features_hd.shape
+        # add the newline token to the HD image feature patches
+        newline_embeddings = self.sub_GN.expand(num_images, h, -1,
+                                                -1)  # (n_img, h, 1, hid_dim)
+        image_features_hd_newline = torch.cat(
+            [image_features_hd, newline_embeddings],
+            dim=2).reshape(num_images, -1, hid_dim)
+        return image_features_hd_newline
+
+
+class Phi3VProcessingInfo(BaseProcessingInfo):
+
+    def get_hf_processor(
+        self,
+        *,
+        num_crops: Optional[int] = None,
+    ) -> ProcessorMixin:
+        if num_crops is not None:
+            return self.ctx.get_hf_processor(num_crops=num_crops)
+
+        return self.ctx.get_hf_processor()
+
+    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+        return {"image": None}
+
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        target_width, target_height = self.get_image_size_with_most_features()
+
+        max_image_tokens = self.get_num_image_tokens(
+            image_width=target_width,
+            image_height=target_height,
+            processor=None,
+        )
+
+        return {"image": max_image_tokens}
+
+    def get_num_image_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        processor: Optional[ProcessorMixin],
+    ) -> int:
+        if processor is None:
+            processor = self.get_hf_processor()
+
+        return processor.calc_num_image_tokens_from_image_size(  # type: ignore
+            width=image_width,
+            height=image_height,
+        )
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        # Result in the max possible feature size (h:w = 16:1)
+        return ImageSize(height=8000, width=50)
+
+
+class Phi3VDummyInputsBuilder(BaseDummyInputsBuilder[Phi3VProcessingInfo]):
+
+    def get_dummy_processor_inputs(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> ProcessorInputs:
+        num_images = mm_counts.get("image", 0)
+
+        target_width, target_height = \
+            self.info.get_image_size_with_most_features()
+
+        mm_data = {
+            "image":
+            self._get_dummy_images(width=target_width,
+                                   height=target_height,
+                                   num_images=num_images)
+        }
+
+        hf_processor = self.info.get_hf_processor()
+        image_tokens: list[str] = hf_processor.img_tokens  # type: ignore
+
+        return ProcessorInputs(
+            prompt_text="".join(image_tokens[:num_images]),
+            mm_data=mm_data,
+        )
+
+
+class Phi3VMultiModalProcessor(BaseMultiModalProcessor[Phi3VProcessingInfo]):
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        processed_outputs = super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+        )
+
+        input_ids = processed_outputs["input_ids"]
+        assert isinstance(input_ids, torch.Tensor)
+
+        # Phi3v processor has inserted -1, -2 etc as placeholder in prompt_ids,
+        # which will cause OverflowError when decoding the prompt_ids.
+        # Therefore, we need to do an early replacement here
+        input_ids.masked_fill_(input_ids < 0, _IMAGE_TOKEN_ID)
+
+        return processed_outputs
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return dict(
+            pixel_values=MultiModalFieldConfig.batched("image"),
+            image_sizes=MultiModalFieldConfig.batched("image"),
+            image_embeds=MultiModalFieldConfig.batched("image"),
+        )
+
+    def _get_prompt_replacements(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, Any],
+        out_mm_kwargs: MultiModalKwargs,
+    ) -> list[PromptReplacement]:
+        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        image_tokens: list[str] = hf_processor.img_tokens  # type: ignore
+
+        tokenizer = self.info.get_tokenizer()
+        bos_token_id = tokenizer.bos_token_id
+        assert isinstance(bos_token_id, int)
+
+        def get_replacement_phi3v(item_idx: int):
+            images = mm_items.get_items(
+                "image", (ImageEmbeddingItems, ImageProcessorItems))
+
+            if isinstance(images, ImageEmbeddingItems):
+                num_image_tokens = images.get_feature_size(item_idx)
+            else:
+                image_size = images.get_image_size(item_idx)
+                num_image_tokens = self.info.get_num_image_tokens(
+                    image_width=image_size.width,
+                    image_height=image_size.height,
+                    processor=hf_processor,
+                )
+
+            image_tokens = [_IMAGE_TOKEN_ID] * num_image_tokens
+
+            return PromptReplacementDetails(
+                full=image_tokens + [bos_token_id],
+                features=image_tokens,
+            )
+
+        num_images = mm_items.get_count("image", strict=False)
+
+        return [
+            PromptReplacement(
+                modality="image",
+                target=image_token,
+                replacement=get_replacement_phi3v,
+            ) for image_token in image_tokens[:num_images]
+        ]
+
+    def _apply_prompt_replacements(
+        self,
+        token_ids: list[int],
+        mm_prompt_repls: Mapping[str, Sequence[BoundPromptReplacement]],
+        mm_item_counts: Mapping[str, int],
+    ) -> tuple[list[int], str, Mapping[str, list[PlaceholderFeaturesInfo]]]:
+        token_ids, text, placeholders = super()._apply_prompt_replacements(
+            token_ids=token_ids,
+            mm_prompt_repls=mm_prompt_repls,
+            mm_item_counts=mm_item_counts,
+        )
+
+        # Keep the behavior in line with HF processor
+        if text.startswith("<s> <|image|>"):
+            text = text.replace("<s> <|image|>", "<s><|image|>", 1)
+            token_ids = [token_ids[0], *token_ids[2:]]
+            placeholders = {
+                modality: [
+                    PlaceholderFeaturesInfo(
+                        modality=p.modality,
+                        item_idx=p.item_idx,
+                        start_idx=p.start_idx - 1,
+                        tokens=p.tokens,
+                    ) for p in ps
+                ]
+                for modality, ps in placeholders.items()
+            }
+
+        return token_ids, text, placeholders
+
+
+@MULTIMODAL_REGISTRY.register_processor(Phi3VMultiModalProcessor,
+                                        info=Phi3VProcessingInfo,
+                                        dummy_inputs=Phi3VDummyInputsBuilder)
+class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.vision_embed_tokens.wte": "embed_tokens",
+            "model.vision_embed_tokens.": "vision_embed_tokens.",
+            "lm_head.": "language_model.lm_head.",
+            "model.": "language_model.model.",
+        })
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        multimodal_config = vllm_config.model_config.multimodal_config
         self.config = config
         self.multimodal_config = multimodal_config
+        self.image_token_id = _IMAGE_TOKEN_ID
 
-        self.model = LlamaModel(config, cache_config, quant_config)
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "model.embed_tokens"),
+        )
 
-        # TODO: Optionally initializes this for supporting embeddings.
+        # TODO: Optionally initializes this for supporting input embeddings.
         self.vision_embed_tokens = Phi3HDImageEmbedding(
-            config, self.model.embed_tokens)
-        self.lm_head = ParallelLMHead(config.vocab_size,
-                                      config.hidden_size,
-                                      quant_config=quant_config)
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
+            config,
+            quant_config,
+            prefix=maybe_prefix(prefix, "model.vision_embed_tokens"))
+
+        self.language_model = init_vllm_registered_model(
+            vllm_config=vllm_config,
+            # The prefix is empty intentionally because default prefix of
+            # LlamaForCausalLM is "model"
+            prefix="",
+            # We don't directly initialize vLLM's LlamaForCausalLM so we
+            # can automatically apply embedding wrapper if this model is
+            # initialized as an embedding model
+            architectures=["LlamaForCausalLM"],
+        )
+
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors)
+
+    @cached_property
+    def sampler(self):
+        if hasattr(self.language_model, "sampler"):
+            return self.language_model.sampler
+
+        return get_sampler()
 
     def _validate_image_sizes(self, data: torch.Tensor) -> torch.Tensor:
-        if list(data.shape[1:]) != [2]:
-            raise ValueError(
-                f"The expected image sizes shape is batch dimension plus "
-                f"{[2]}. You supplied {data.shape}.")
+        expected_dims = (2, )
+
+        def _validate_shape(d: torch.Tensor):
+            actual_dims = tuple(d.shape)
+
+            if actual_dims != expected_dims:
+                expected_expr = str(expected_dims)
+                raise ValueError(
+                    f"The expected shape of image sizes per image per batch "
+                    f"is {expected_expr}. You supplied {tuple(d.shape)}.")
+
+        for d in data:
+            _validate_shape(d)
 
         return data
 
@@ -475,42 +572,101 @@ class Phi3VForCausalLM(nn.Module, SupportsVision):
         self, data: Union[torch.Tensor, List[torch.Tensor]]
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
 
-        def _validate_shape(data: torch.Tensor):
-            if list(data.shape)[2:] != [
-                    3, CLIP_VIT_LARGE_PATCH14_336_CONFIG.image_size,
-                    CLIP_VIT_LARGE_PATCH14_336_CONFIG.image_size
-            ]:
-                raise ValueError(
-                    "The expected pixel value tensor shape is batch dimension "
-                    "plus patch number, channel, height and width.")
+        h = w = CLIP_VIT_LARGE_PATCH14_336_CONFIG.image_size
+        expected_dims = (3, h, w)
 
-        if isinstance(data, torch.Tensor):
-            _validate_shape(data)
-        else:
-            [_validate_shape(d) for d in data]
+        def _validate_shape(d: torch.Tensor):
+            actual_dims = tuple(d.shape[1:])
+
+            if actual_dims != expected_dims:
+                expected_expr = ("num_patches", *map(str, expected_dims))
+                raise ValueError(
+                    "The expected shape of pixel values per image per batch "
+                    f"is {expected_expr}. You supplied {tuple(d.shape)}.")
+
+        for d in data:
+            _validate_shape(d)
 
         return data
 
     def _parse_and_validate_image_input(
-            self, **kwargs: object) -> Optional[Phi3VImagePixelInputs]:
+            self, **kwargs: object) -> Optional[Phi3VImageInputs]:
         pixel_values = kwargs.pop("pixel_values", None)
         image_sizes = kwargs.pop("image_sizes", None)
+        image_embeds = kwargs.pop("image_embeds", None)
 
-        if pixel_values is None:
+        if pixel_values is None and image_embeds is None:
             return None
 
-        if not isinstance(pixel_values, (torch.Tensor, list)):
-            raise ValueError("Incorrect type of pixel values. "
-                             f"Got type: {type(pixel_values)}")
+        if pixel_values is not None:
+            if not isinstance(pixel_values, (torch.Tensor, list)):
+                raise ValueError("Incorrect type of pixel values. "
+                                 f"Got type: {type(pixel_values)}")
 
-        if not isinstance(image_sizes, torch.Tensor):
-            raise ValueError("Incorrect type of image sizes. "
-                             f"Got type: {type(image_sizes)}")
+            if not isinstance(image_sizes, (torch.Tensor, list)):
+                raise ValueError("Incorrect type of image sizes. "
+                                 f"Got type: {type(image_sizes)}")
 
-        return Phi3VImagePixelInputs(
-            type="pixel_values",
-            data=self._validate_pixel_values(pixel_values),
-            image_sizes=self._validate_image_sizes(image_sizes))
+            return Phi3VImagePixelInputs(
+                type="pixel_values",
+                data=self._validate_pixel_values(flatten_bn(pixel_values)),
+                image_sizes=self._validate_image_sizes(
+                    flatten_bn(image_sizes, concat=True)))
+
+        if image_embeds is not None:
+            if not isinstance(image_embeds, torch.Tensor):
+                raise ValueError("Incorrect type of image embeddings. "
+                                 f"Got type: {type(image_embeds)}")
+
+            return Phi3VImageEmbeddingInputs(
+                type="image_embeds",
+                data=flatten_bn(image_embeds),
+            )
+
+        raise AssertionError("This line should be unreachable.")
+
+    def _process_image_input(
+        self,
+        image_input: Phi3VImageInputs,
+    ) -> torch.Tensor:
+
+        if image_input["type"] == "image_embeds":
+            image_data = image_input["data"]
+            if is_list_of(image_data, torch.Tensor):
+                # it's already a list of tensors
+                return image_data
+            if len(image_data.shape) == 3:
+                # 3D tensor
+                return list(torch.unbind(image_data, dim=0))
+            raise ValueError(
+                "We expect batched 2D tensors;"
+                "this can be either a list of 2D tensors or a single 3D tensor."
+            )
+
+        assert self.vision_embed_tokens is not None
+        image_embeds = self.vision_embed_tokens(image_input["data"],
+                                                image_input["image_sizes"])
+
+        return image_embeds
+
+    def get_multimodal_embeddings(self, **kwargs) -> Optional[NestedTensors]:
+        image_input = self._parse_and_validate_image_input(**kwargs)
+        if image_input is None:
+            return None
+        vision_embeddings = self._process_image_input(image_input)
+        return vision_embeddings
+
+    def get_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Optional[NestedTensors] = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self.embed_tokens(input_ids)
+        if multimodal_embeddings is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids, inputs_embeds, multimodal_embeddings,
+                self.image_token_id)
+        return inputs_embeds
 
     def forward(self,
                 input_ids: torch.Tensor,
@@ -518,75 +674,54 @@ class Phi3VForCausalLM(nn.Module, SupportsVision):
                 kv_caches: List[torch.Tensor],
                 attn_metadata: AttentionMetadata,
                 intermediate_tensors: Optional[IntermediateTensors] = None,
+                inputs_embeds: Optional[torch.Tensor] = None,
                 **kwargs: object):
-        image_input = self._parse_and_validate_image_input(**kwargs)
 
-        if image_input is not None:
-            inputs_embeds = self.vision_embed_tokens(
-                input_ids, image_input["data"], image_input["image_sizes"])
-
-            input_ids = None
-        else:
+        if intermediate_tensors is not None:
             inputs_embeds = None
 
-        hidden_states = self.model(input_ids,
-                                   positions,
-                                   kv_caches,
-                                   attn_metadata,
-                                   intermediate_tensors,
-                                   inputs_embeds=inputs_embeds)
+        # NOTE: In v1, inputs_embeds is always generated at model runner, this
+        # condition is for v0 compatibility
+        elif inputs_embeds is None:
+            vision_embeddings = self.get_multimodal_embeddings(**kwargs)
+            inputs_embeds = self.get_input_embeddings(input_ids,
+                                                      vision_embeddings)
+            input_ids = None
+
+        hidden_states = self.language_model.model(input_ids,
+                                                  positions,
+                                                  kv_caches,
+                                                  attn_metadata,
+                                                  intermediate_tensors,
+                                                  inputs_embeds=inputs_embeds)
 
         return hidden_states
 
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
-        return logits
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[torch.Tensor]:
+        return self.language_model.compute_logits(hidden_states,
+                                                  sampling_metadata)
 
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
+        return self.language_model.sample(logits, sampling_metadata)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            # post_layernorm is not needed in CLIPVisionModel
-            if "vision_model.post_layernorm" in name:
-                continue
-            for key_to_modify, new_key in _KEYS_TO_MODIFY_MAPPING.items():
-                if key_to_modify in name:
-                    name = name.replace(key_to_modify, new_key)
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                # We only do sharding for language model
-                # and not vision model for now.
-                if "vision_embed_tokens" in name and self.vision_embed_tokens:
-                    continue
-                if weight_name not in name:
-                    continue
-                param = params_dict[name.replace(weight_name, param_name)]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str,
+                                                   torch.Tensor]]) -> Set[str]:
+
+        loader = AutoWeightsLoader(self)
+        autoloaded_weights = loader.load_weights(weights,
+                                                 mapper=self.hf_to_vllm_mapper)
+
+        # The HF config doesn't specify whether these are tied,
+        # so we detect it this way
+        if "embed_tokens.weight" not in autoloaded_weights:
+            self.embed_tokens = self.language_model.model.embed_tokens
+            autoloaded_weights.add("embed_tokens.weight")
+        return autoloaded_weights
